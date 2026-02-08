@@ -1,0 +1,31 @@
+{
+  "name": "napcat-plugin-openclaw",
+  "version": "1.0.0",
+  "description": "NapCat 插件 - 连接 OpenClaw Agent 执行群任务",
+  "main": "index.mjs",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "dev": "tsc && node dist/index.mjs"
+  },
+  "keywords": [
+    "napcat",
+    "plugin",
+    "openclaw"
+  ],
+  "author": "Seren",
+  "license": "MIT",
+  "napcat": {
+    "name": "OpenClaw 任务助手",
+    "description": "通过 OpenClaw Agent 执行群任务（代码、查询、翻译等）",
+    "version": "1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
