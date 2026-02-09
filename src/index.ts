@@ -1,387 +1,437 @@
-// NapCat Plugin Entry Point
-// 遵循 NapCat 插件规范: https://napneko.github.io/develop/plugin/
+/**
+ * NapCat Plugin: OpenClaw AI Channel
+ *
+ * 通过 OpenClaw Gateway 的 WebSocket RPC 协议（chat.send）将 QQ 变为 AI 助手通道。
+ * 所有斜杠命令由 Gateway 统一处理，与 TUI/Telegram 体验一致。
+ *
+ * @author CharTyr
+ * @license MIT
+ */
 
-import { OpenClawClient } from './openclaw-client.js';
-import { TaskManager } from './task-manager.js';
-import { ConfigManager } from './config-manager.js';
-import { FileFetcher } from './file-fetcher.js';
+import { randomUUID } from 'crypto';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+import { GatewayClient } from './gateway-client';
+import { DEFAULT_CONFIG, buildConfigSchema } from './config';
+import type { PluginConfig, ExtractedMedia, ChatEventPayload, ContentBlock } from './types';
 
-interface PluginContext {
-  actions: {
-    call: (action: string, params: any) => Promise<any>;
-  };
-  log: {
-    info: (msg: string) => void;
-    error: (msg: string) => void;
-    warn: (msg: string) => void;
-  };
+const execAsync = promisify(exec);
+
+// ========== State ==========
+let logger: any = null;
+let configPath: string | null = null;
+let botUserId: string | number | null = null;
+let gatewayClient: GatewayClient | null = null;
+let currentConfig: PluginConfig = { ...DEFAULT_CONFIG };
+
+// ========== Local Commands ==========
+
+function cmdHelp(): string {
+  return [
+    'ℹ️ Help',
+    '',
+    'Session',
+    '  /new  |  /clear  |  /stop',
+    '',
+    'Options',
+    '  /think <level>  |  /model <id>  |  /verbose on|off',
+    '',
+    'Status',
+    '  /status  |  /whoami  |  /context',
+    '',
+    '所有 OpenClaw 命令均可直接使用',
+    '更多: /commands',
+  ].join('\n');
 }
 
-interface MessageEvent {
-  post_type: string;
-  message_type?: string;
-  group_id?: number;
-  user_id: number;
-  message_id: number;
-  message: Array<{ type: string; data: any }>;
-  sender?: {
-    nickname?: string;
-  };
+function cmdWhoami(
+  sessionBase: string,
+  userId: number | string,
+  nickname: string,
+  messageType: string,
+  groupId?: number | string
+): string {
+  const epoch = sessionEpochs.get(sessionBase) || 0;
+  const sessionKey = epoch > 0 ? `${sessionBase}-${epoch}` : sessionBase;
+  return [
+    `👤 ${nickname}`,
+    `QQ: ${userId}`,
+    `类型: ${messageType === 'private' ? '私聊' : `群聊 (${groupId})`}`,
+    `Session: ${sessionKey}`,
+  ].join('\n');
 }
 
-let ctx: PluginContext | null = null;
-let configManager: ConfigManager | null = null;
-let taskManager: TaskManager | null = null;
-let openClawClient: OpenClawClient | null = null;
-let fileFetcher: FileFetcher | null = null;
-let lastSendTime = 0;
+const LOCAL_COMMANDS: Record<string, (...args: any[]) => string> = {
+  '/help': cmdHelp,
+  '/whoami': cmdWhoami,
+};
 
-// ========== NapCat 生命周期钩子 ==========
+// ========== Session Management ==========
+const sessionEpochs = new Map<string, number>();
 
-export async function plugin_init(context: PluginContext): Promise<void> {
-  ctx = context;
-  ctx.log.info('[OpenClaw] Plugin initializing...');
-
-  // 初始化配置管理器
-  configManager = new ConfigManager();
-  
-  // 初始化任务管理器
-  taskManager = new TaskManager(configManager.getLimits());
-  
-  // 初始化 OpenClaw 客户端
-  const openClawConfig = configManager.getOpenClawConfig();
-  openClawClient = new OpenClawClient(
-    openClawConfig.host,
-    openClawConfig.port,
-    openClawConfig.token,
-    (msg) => ctx?.log.info(msg),
-    (msg) => ctx?.log.error(msg)
-  );
-
-  // 初始化文件获取器
-  fileFetcher = new FileFetcher(openClawConfig.host, openClawConfig.user || 'root');
-
-  ctx.log.info('[OpenClaw] Plugin initialized successfully');
+function getSessionBase(messageType: string, userId: number | string, groupId?: number | string): string {
+  if (messageType === 'private') return `qq-${userId}`;
+  return `qq-g${groupId}-${userId}`;
 }
 
-export async function plugin_onmessage(event: MessageEvent): Promise<void> {
-  if (!ctx || !configManager || !taskManager || !openClawClient || !fileFetcher) {
-    return;
+function getSessionKey(sessionBase: string): string {
+  const epoch = sessionEpochs.get(sessionBase) || 0;
+  return epoch > 0 ? `${sessionBase}-${epoch}` : sessionBase;
+}
+
+// ========== Gateway ==========
+
+async function getGateway(): Promise<GatewayClient> {
+  if (!gatewayClient) {
+    gatewayClient = new GatewayClient(
+      currentConfig.openclaw.gatewayUrl,
+      currentConfig.openclaw.token,
+      logger
+    );
   }
-
-  // 只处理群消息
-  if (event.post_type !== 'message' || event.message_type !== 'group') {
-    return;
+  if (!gatewayClient.connected) {
+    await gatewayClient.connect();
   }
+  return gatewayClient;
+}
 
-  const groupId = event.group_id;
-  const userId = event.user_id;
-  const messageId = event.message_id;
-  const nickname = event.sender?.nickname || '未知';
+// ========== Message Extraction ==========
 
-  if (!groupId) return;
+function extractMessage(segments: any[]): { extractedText: string; extractedMedia: ExtractedMedia[] } {
+  const textParts: string[] = [];
+  const media: ExtractedMedia[] = [];
 
-  // 检查白名单
-  if (!configManager.isGroupAllowed(groupId)) return;
-  if (!configManager.isUserAllowed(userId)) return;
-
-  // 提取文本
-  const text = extractText(event.message);
-  if (!text) return;
-
-  // 检查是否有等待输入的任务
-  const waitingTask = taskManager.getWaitingTask(groupId, userId);
-  if (waitingTask) {
-    await continueTask(waitingTask, text, groupId, messageId);
-    return;
-  }
-
-  // 检查触发词
-  const triggerResult = checkTrigger(text, event.message, configManager.getTriggers());
-  if (!triggerResult.triggered) return;
-
-  ctx.log.info(`[OpenClaw] Triggered by ${nickname}(${userId}): ${triggerResult.taskText.slice(0, 50)}`);
-
-  // 创建任务
-  const sessionKey = `qq-${groupId}-${userId}`;
-  const createResult = taskManager.createTask(groupId, userId, nickname, triggerResult.taskText, messageId, sessionKey);
-  
-  if (!createResult.ok) {
-    await sendReply(groupId, messageId, createResult.error || '创建任务失败');
-    return;
-  }
-
-  const task = createResult.task!;
-
-  // 意图过滤
-  if (configManager.isFilterEnabled()) {
-    const filterResult = await openClawClient.filterTask(triggerResult.taskText, nickname);
-    if (!filterResult.accept) {
-      taskManager.failTask(task.taskId, 'filtered');
-      await sendReply(groupId, messageId, filterResult.reason || '这个请求我帮不了呢~');
-      return;
+  for (const seg of segments) {
+    switch (seg.type) {
+      case 'text': {
+        const t = seg.data?.text?.trim();
+        if (t) textParts.push(t);
+        break;
+      }
+      case 'image':
+        if (seg.data?.url) media.push({ type: 'image', url: seg.data.url });
+        break;
+      case 'at':
+        if (String(seg.data?.qq) !== String(botUserId)) {
+          textParts.push(`@${seg.data?.name || seg.data?.qq}`);
+        }
+        break;
+      case 'file':
+        if (seg.data?.url) media.push({ type: 'file', url: seg.data.url, name: seg.data?.name });
+        break;
+      case 'record':
+        if (seg.data?.url) media.push({ type: 'voice', url: seg.data.url });
+        break;
+      case 'video':
+        if (seg.data?.url) media.push({ type: 'video', url: seg.data.url });
+        break;
     }
   }
 
-  // 执行任务
-  await runTask(task, groupId, messageId);
+  return { extractedText: textParts.join(' '), extractedMedia: media };
 }
 
-export async function plugin_cleanup(): Promise<void> {
-  ctx?.log.info('[OpenClaw] Plugin cleaning up...');
-  openClawClient?.close();
-  ctx?.log.info('[OpenClaw] Plugin cleaned up');
+// ========== Text Extraction from Chat Event ==========
+
+function extractTextFromPayload(message: any): string {
+  if (typeof message === 'string') return message;
+  if (!message) return '';
+
+  const content = message.content;
+  if (!content) return '';
+
+  const blocks: any[] = Array.isArray(content) ? content : [content];
+  let text = '';
+  for (const b of blocks) {
+    if (typeof b === 'string') text += b;
+    else if (b?.text) text += b.text;
+  }
+  return text;
 }
 
-// ========== WebUI 配置 ==========
+// ========== Typing Status ==========
 
-export const plugin_config_ui = {
-  openclaw: {
-    type: 'object',
-    description: 'OpenClaw 连接配置',
-    properties: {
-      host: { type: 'string', default: '202.47.135.226', description: 'OpenClaw 主机地址' },
-      port: { type: 'number', default: 18789, description: 'OpenClaw 端口' },
-      token: { type: 'string', default: '', description: 'OpenClaw 认证 Token' },
-      user: { type: 'string', default: 'root', description: 'SSH 用户名（用于 SCP 文件传输）' }
+async function setTypingStatus(ctx: any, userId: number | string, typing: boolean): Promise<void> {
+  try {
+    await ctx.actions.call(
+      'set_input_status',
+      { user_id: String(userId), event_type: typing ? 1 : 0 },
+      ctx.adapterName,
+      ctx.pluginManager?.config
+    );
+  } catch (e: any) {
+    logger?.warn(`[OpenClaw] 设置输入状态失败: ${e.message}`);
+  }
+}
+
+// ========== Message Sending ==========
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function sendReply(ctx: any, messageType: string, groupId: any, userId: any, text: string): Promise<void> {
+  const action = messageType === 'group' ? 'send_group_msg' : 'send_private_msg';
+  const idKey = messageType === 'group' ? 'group_id' : 'user_id';
+  const idVal = String(messageType === 'group' ? groupId : userId);
+
+  const maxLen = 3000;
+  if (text.length <= maxLen) {
+    await ctx.actions.call(action, { [idKey]: idVal, message: text }, ctx.adapterName, ctx.pluginManager?.config);
+  } else {
+    const total = Math.ceil(text.length / maxLen);
+    for (let i = 0; i < text.length; i += maxLen) {
+      const idx = Math.floor(i / maxLen) + 1;
+      const prefix = total > 1 ? `[${idx}/${total}]\n` : '';
+      await ctx.actions.call(
+        action,
+        { [idKey]: idVal, message: prefix + text.slice(i, i + maxLen) },
+        ctx.adapterName,
+        ctx.pluginManager?.config
+      );
+      if (i + maxLen < text.length) await sleep(1000);
     }
-  },
-  triggers: {
-    type: 'object',
-    description: '触发词配置',
-    properties: {
-      keywords: { 
-        type: 'array', 
-        items: { type: 'string' },
-        default: ['莲莲帮我'],
-        description: '触发关键词列表'
-      },
-      atTrigger: { type: 'boolean', default: false, description: '是否支持 @ 触发' }
+  }
+}
+
+// ========== Lifecycle ==========
+
+export let plugin_config_ui: any[] = [];
+
+export const plugin_init = async (ctx: any): Promise<void> => {
+  logger = ctx.logger;
+  configPath = ctx.configPath;
+  logger.info('[OpenClaw] QQ Channel 插件初始化中...');
+
+  // Load saved config
+  try {
+    if (configPath && fs.existsSync(configPath)) {
+      const saved = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      currentConfig = deepMerge(currentConfig, saved);
+      logger.info('[OpenClaw] 已加载保存的配置');
     }
-  },
-  whitelist: {
-    type: 'object',
-    description: '白名单配置（空数组表示允许所有）',
-    properties: {
-      users: { type: 'array', items: { type: 'number' }, default: [], description: '允许的用户 QQ 号' },
-      groups: { type: 'array', items: { type: 'number' }, default: [], description: '允许的群号' }
+  } catch (e: any) {
+    logger.warn('[OpenClaw] 加载配置失败: ' + e.message);
+  }
+
+  plugin_config_ui = buildConfigSchema();
+
+  // Pre-connect gateway
+  try {
+    await getGateway();
+    logger.info('[OpenClaw] Gateway 连接就绪');
+  } catch (e: any) {
+    logger.error(`[OpenClaw] Gateway 预连接失败: ${e.message}（将在首次消息时重试）`);
+  }
+
+  logger.info(`[OpenClaw] 网关: ${currentConfig.openclaw.gatewayUrl}`);
+  logger.info('[OpenClaw] 模式: 私聊全透传 + 群聊@触发 + 命令透传');
+  logger.info('[OpenClaw] QQ Channel 插件初始化完成');
+};
+
+export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
+  try {
+    if (!logger) return;
+    if (event.post_type !== 'message') return;
+
+    const userId = event.user_id;
+    const nickname = event.sender?.nickname || '未知';
+    const messageType = event.message_type;
+    const groupId = event.group_id;
+
+    if (!botUserId && event.self_id) {
+      botUserId = event.self_id;
+      logger.info(`[OpenClaw] Bot QQ: ${botUserId}`);
     }
-  },
-  limits: {
-    type: 'object',
-    description: '限流配置',
-    properties: {
-      ratePerUserPerHour: { type: 'number', default: 5, description: '每小时每用户请求限制' },
-      maxConcurrent: { type: 'number', default: 3, description: '最大并发任务数' },
-      taskTimeoutSec: { type: 'number', default: 180, description: '任务超时时间（秒）' },
-      cooldownSec: { type: 'number', default: 3, description: '发送消息冷却时间（秒）' }
+
+    // User whitelist
+    const userWhitelist = currentConfig.behavior.userWhitelist;
+    if (userWhitelist.length > 0) {
+      if (!userWhitelist.some((id) => Number(id) === Number(userId))) return;
     }
-  },
-  filter: {
-    type: 'object',
-    description: '意图过滤配置',
-    properties: {
-      enabled: { type: 'boolean', default: true, description: '是否启用意图过滤' }
+
+    let shouldHandle = false;
+
+    if (messageType === 'private') {
+      if (!currentConfig.behavior.privateChat) return;
+      shouldHandle = true;
+    } else if (messageType === 'group') {
+      if (!groupId) return;
+      const gWhitelist = currentConfig.behavior.groupWhitelist;
+      if (gWhitelist.length > 0 && !gWhitelist.some((id) => Number(id) === Number(groupId))) return;
+      if (currentConfig.behavior.groupAtOnly) {
+        const isAtBot = event.message?.some(
+          (seg: any) => seg.type === 'at' && String(seg.data?.qq) === String(botUserId || event.self_id)
+        );
+        if (!isAtBot) return;
+      }
+      shouldHandle = true;
+    }
+
+    if (!shouldHandle) return;
+
+    const { extractedText, extractedMedia } = extractMessage(event.message || []);
+    const text = extractedText;
+    if (!text && extractedMedia.length === 0) return;
+
+    const sessionBase = getSessionBase(messageType, userId, groupId);
+
+    // Local commands
+    if (text?.startsWith('/')) {
+      const spaceIdx = text.indexOf(' ');
+      const cmd = (spaceIdx > 0 ? text.slice(0, spaceIdx) : text).toLowerCase();
+      const args = spaceIdx > 0 ? text.slice(spaceIdx + 1).trim() : '';
+
+      if (LOCAL_COMMANDS[cmd]) {
+        logger.info(`[OpenClaw] 本地命令: ${cmd} from ${nickname}(${userId})`);
+        const result = LOCAL_COMMANDS[cmd](sessionBase, userId, nickname, messageType, groupId, args);
+        if (result) {
+          await sendReply(ctx, messageType, groupId, userId, result);
+          return;
+        }
+      }
+    }
+
+    // Build message
+    let openclawMessage = text;
+    if (extractedMedia.length > 0) {
+      const mediaInfo = extractedMedia.map((m) => `[${m.type}: ${m.url}]`).join('\n');
+      openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+    }
+
+    logger.info(
+      `[OpenClaw] ${messageType === 'private' ? '私聊' : `群${groupId}`} ${nickname}(${userId}): ${openclawMessage.slice(0, 80)}`
+    );
+
+    if (messageType === 'private') setTypingStatus(ctx, userId, true);
+
+    // Send via Gateway RPC
+    const sessionKey = getSessionKey(sessionBase);
+    const runId = randomUUID();
+
+    try {
+      const gw = await getGateway();
+
+      const replyPromise = new Promise<string | null>((resolve) => {
+        let replyText = '';
+        const timeout = setTimeout(() => {
+          cleanup();
+          resolve(replyText.trim() || null);
+        }, 180000);
+
+        const cleanup = () => {
+          clearTimeout(timeout);
+          gw.eventHandlers.delete('chat');
+        };
+
+        gw.eventHandlers.set('chat', (payload: ChatEventPayload) => {
+          if (!payload || payload.sessionKey !== sessionKey) return;
+
+          if (payload.state === 'delta') {
+            replyText += extractTextFromPayload(payload.message);
+          }
+
+          if (payload.state === 'final') {
+            if (!replyText && payload.message) {
+              replyText = extractTextFromPayload(payload.message);
+            }
+            cleanup();
+            resolve(replyText.trim() || null);
+          }
+
+          if (payload.state === 'aborted') {
+            cleanup();
+            resolve(replyText.trim() || '⏹ 已中止');
+          }
+
+          if (payload.state === 'error') {
+            cleanup();
+            resolve(replyText.trim() || `❌ ${payload.errorMessage || '处理出错'}`);
+          }
+        });
+      });
+
+      const result = await gw.request('chat.send', {
+        sessionKey,
+        message: openclawMessage,
+        idempotencyKey: runId,
+      });
+
+      logger.info(`[OpenClaw] chat.send: runId=${result?.runId} status=${result?.status}`);
+
+      const reply = await replyPromise;
+      if (reply) {
+        await sendReply(ctx, messageType, groupId, userId, reply);
+      } else {
+        logger.info('[OpenClaw] 无回复内容');
+      }
+    } catch (e: any) {
+      logger.error(`[OpenClaw] 发送失败: ${e.message}`);
+      // Disconnect and fallback to CLI
+      if (gatewayClient) {
+        gatewayClient.disconnect();
+        gatewayClient = null;
+      }
+      try {
+        const escapedMessage = openclawMessage.replace(/'/g, "'\\''");
+        const cliPath = currentConfig.openclaw.cliPath;
+        const { stdout } = await execAsync(
+          `OPENCLAW_TOKEN='${currentConfig.openclaw.token}' ${cliPath} agent --session-id '${sessionKey}' --message '${escapedMessage}' 2>&1`,
+          { timeout: 180000, maxBuffer: 1024 * 1024 }
+        );
+        if (stdout.trim()) {
+          await sendReply(ctx, messageType, groupId, userId, stdout.trim());
+        }
+      } catch (e2: any) {
+        await sendReply(ctx, messageType, groupId, userId, `处理出错: ${(e as Error).message?.slice(0, 100)}`);
+      }
+    }
+  } catch (outerErr: any) {
+    logger?.error(`[OpenClaw] 未捕获异常: ${outerErr.message}\n${outerErr.stack}`);
+  }
+};
+
+export const plugin_cleanup = async (): Promise<void> => {
+  if (gatewayClient) {
+    gatewayClient.disconnect();
+    gatewayClient = null;
+  }
+  logger?.info('[OpenClaw] QQ Channel 插件清理完成');
+};
+
+// ========== Config Hooks ==========
+
+export const plugin_get_config = async () => currentConfig;
+
+export const plugin_set_config = async (ctx: any, config: any): Promise<void> => {
+  currentConfig = config;
+  if (gatewayClient) {
+    gatewayClient.disconnect();
+    gatewayClient = null;
+  }
+  if (ctx?.configPath) {
+    try {
+      const dir = path.dirname(ctx.configPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(ctx.configPath, JSON.stringify(config, null, 2), 'utf-8');
+    } catch (e: any) {
+      logger?.error('[OpenClaw] 保存配置失败: ' + e.message);
     }
   }
 };
 
-// ========== 工具函数 ==========
+// ========== Utils ==========
 
-function extractText(message: Array<{ type: string; data: any }>): string {
-  const parts: string[] = [];
-  for (const seg of message) {
-    if (seg.type === 'text') {
-      parts.push(seg.data?.text || '');
+function deepMerge(target: any, source: any): any {
+  const result = { ...target };
+  for (const key of Object.keys(source)) {
+    if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+      result[key] = deepMerge(target[key] || {}, source[key]);
+    } else {
+      result[key] = source[key];
     }
   }
-  return parts.join('').trim();
-}
-
-function isAtBot(message: Array<{ type: string; data: any }>, botUserId: number): boolean {
-  for (const seg of message) {
-    if (seg.type === 'at') {
-      const qq = seg.data?.qq;
-      if (String(qq) === String(botUserId)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-interface TriggerResult {
-  triggered: boolean;
-  taskText: string;
-}
-
-function checkTrigger(
-  text: string, 
-  message: Array<{ type: string; data: any }>,
-  triggers: { keywords: string[]; atTrigger: boolean; botUserId?: number }
-): TriggerResult {
-  // 关键词触发
-  for (const kw of triggers.keywords) {
-    if (text.startsWith(kw)) {
-      const taskText = text.slice(kw.length).trim();
-      return { triggered: true, taskText: taskText || text };
-    }
-  }
-
-  // @触发
-  if (triggers.atTrigger && triggers.botUserId && isAtBot(message, triggers.botUserId)) {
-    return { triggered: true, taskText: text.trim() };
-  }
-
-  return { triggered: false, taskText: '' };
-}
-
-async function sendText(groupId: number, text: string): Promise<void> {
-  if (!ctx) return;
-  await cooldown();
-  
-  // 长文本分段
-  const maxLen = 3000;
-  if (text.length <= maxLen) {
-    await ctx.actions.call('send_group_msg', { group_id: groupId, message: text });
-  } else {
-    const parts = [];
-    for (let i = 0; i < text.length; i += maxLen) {
-      parts.push(text.slice(i, i + maxLen));
-    }
-    for (let i = 0; i < parts.length; i++) {
-      const prefix = parts.length > 1 ? `[${i + 1}/${parts.length}]\n` : '';
-      await ctx.actions.call('send_group_msg', { group_id: groupId, message: prefix + parts[i] });
-      if (i < parts.length - 1) await cooldown();
-    }
-  }
-}
-
-async function sendReply(groupId: number, messageId: number, text: string): Promise<void> {
-  if (!ctx) return;
-  await cooldown();
-  await ctx.actions.call('send_group_msg', {
-    group_id: groupId,
-    message: [
-      { type: 'reply', data: { id: String(messageId) } },
-      { type: 'text', data: { text } }
-    ]
-  });
-}
-
-async function sendFile(groupId: number, filePath: string, fileName: string): Promise<void> {
-  if (!ctx) return;
-  await cooldown();
-  await ctx.actions.call('upload_group_file', {
-    group_id: groupId,
-    file: `file://${filePath}`,
-    name: fileName
-  });
-}
-
-async function cooldown(): Promise<void> {
-  const cooldownSec = configManager?.getCooldown() || 3;
-  const elapsed = Date.now() - lastSendTime;
-  const waitMs = cooldownSec * 1000 - elapsed;
-  if (waitMs > 0) {
-    await new Promise(r => setTimeout(r, waitMs));
-  }
-  lastSendTime = Date.now();
-}
-
-interface Task {
-  taskId: string;
-  groupId: number;
-  userId: number;
-  userNickname: string;
-  text: string;
-  messageId: number;
-  sessionKey: string;
-  state: string;
-}
-
-async function runTask(task: Task, groupId: number, messageId: number): Promise<void> {
-  if (!taskManager || !openClawClient || !fileFetcher) return;
-
-  taskManager.setRunning(task.taskId);
-  await sendReply(groupId, messageId, '收到，处理中...');
-
-  // 创建标记文件用于检测新文件
-  await fileFetcher.createMarker();
-
-  const result = await openClawClient.executeTask(
-    task.text,
-    task.sessionKey,
-    configManager?.getTaskTimeout() || 180
-  );
-
-  if (!result.ok) {
-    taskManager.failTask(task.taskId, result.error || '未知错误');
-    await sendText(groupId, `任务处理失败: ${result.error || '未知错误'}`);
-    return;
-  }
-
-  if (result.needInput) {
-    taskManager.setWaitingInput(task.taskId);
-    await sendText(groupId, result.result || '等待输入...');
-    return;
-  }
-
-  taskManager.completeTask(task.taskId, result.result || '');
-
-  // 发送文本结果
-  await sendText(groupId, result.result || '完成');
-
-  // 检测并获取新文件
-  try {
-    const newFiles = await fileFetcher.fetchNewFiles();
-    if (newFiles.length > 0) {
-      for (const filePath of newFiles) {
-        const fileName = filePath.split('/').pop() || 'file';
-        await sendFile(groupId, filePath, fileName);
-      }
-    }
-  } catch (e) {
-    ctx?.log.error(`[OpenClaw] File fetch error: ${e}`);
-  }
-}
-
-async function continueTask(task: Task, inputText: string, groupId: number, messageId: number): Promise<void> {
-  if (!taskManager || !openClawClient || !fileFetcher) return;
-
-  taskManager.setRunning(task.taskId);
-
-  const result = await openClawClient.executeTask(
-    inputText,
-    task.sessionKey,
-    configManager?.getTaskTimeout() || 180
-  );
-
-  if (!result.ok) {
-    taskManager.failTask(task.taskId, result.error || '未知错误');
-    await sendText(groupId, `处理失败: ${result.error || '未知错误'}`);
-    return;
-  }
-
-  if (result.needInput) {
-    taskManager.setWaitingInput(task.taskId);
-    await sendText(groupId, result.result || '等待输入...');
-    return;
-  }
-
-  taskManager.completeTask(task.taskId, result.result || '');
-  await sendText(groupId, result.result || '完成');
-
-  // 检测新文件
-  try {
-    const newFiles = await fileFetcher.fetchNewFiles();
-    if (newFiles.length > 0) {
-      for (const filePath of newFiles) {
-        const fileName = filePath.split('/').pop() || 'file';
-        await sendFile(groupId, filePath, fileName);
-      }
-    }
-  } catch (e) {
-    ctx?.log.error(`[OpenClaw] File fetch error: ${e}`);
-  }
+  return result;
 }
