@@ -405,10 +405,49 @@ export const plugin_cleanup = async (): Promise<void> => {
 
 // ========== Config Hooks ==========
 
-export const plugin_get_config = async () => currentConfig;
+// Flatten nested config to flat keys for WebUI
+function flattenConfig(cfg: PluginConfig): Record<string, any> {
+  return {
+    token: cfg.openclaw.token,
+    gatewayUrl: cfg.openclaw.gatewayUrl,
+    cliPath: cfg.openclaw.cliPath,
+    privateChat: cfg.behavior.privateChat,
+    groupAtOnly: cfg.behavior.groupAtOnly,
+    userWhitelist: cfg.behavior.userWhitelist.join(','),
+    groupWhitelist: cfg.behavior.groupWhitelist.join(','),
+    debounceMs: cfg.behavior.debounceMs,
+    groupSessionMode: cfg.behavior.groupSessionMode,
+  };
+}
+
+// Unflatten flat WebUI config back to nested structure
+function unflattenConfig(flat: Record<string, any>): PluginConfig {
+  const parseNumList = (s: any): number[] => {
+    if (Array.isArray(s)) return s.map(Number).filter(Boolean);
+    if (typeof s === 'string' && s.trim()) return s.split(',').map((x: string) => Number(x.trim())).filter(Boolean);
+    return [];
+  };
+  return {
+    openclaw: {
+      token: flat.token ?? '',
+      gatewayUrl: flat.gatewayUrl ?? 'ws://127.0.0.1:18789',
+      cliPath: flat.cliPath ?? '/root/.nvm/versions/node/v22.22.0/bin/openclaw',
+    },
+    behavior: {
+      privateChat: flat.privateChat !== false,
+      groupAtOnly: flat.groupAtOnly !== false,
+      userWhitelist: parseNumList(flat.userWhitelist),
+      groupWhitelist: parseNumList(flat.groupWhitelist),
+      debounceMs: Number(flat.debounceMs) || 2000,
+      groupSessionMode: flat.groupSessionMode === 'shared' ? 'shared' : 'user',
+    },
+  };
+}
+
+export const plugin_get_config = async () => flattenConfig(currentConfig);
 
 export const plugin_set_config = async (ctx: any, config: any): Promise<void> => {
-  currentConfig = config;
+  currentConfig = unflattenConfig(config);
   if (gatewayClient) {
     gatewayClient.disconnect();
     gatewayClient = null;
@@ -417,7 +456,7 @@ export const plugin_set_config = async (ctx: any, config: any): Promise<void> =>
     try {
       const dir = path.dirname(ctx.configPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(ctx.configPath, JSON.stringify(config, null, 2), 'utf-8');
+      fs.writeFileSync(ctx.configPath, JSON.stringify(currentConfig, null, 2), 'utf-8');
     } catch (e: any) {
       logger?.error('[OpenClaw] 保存配置失败: ' + e.message);
     }
