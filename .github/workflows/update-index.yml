@@ -214,8 +214,7 @@ jobs:
               data.plugins.push(newPlugin);
             }
 
-            // 更新时间戳
-            data.updateTime = new Date().toISOString().replace(/\.\d{3}Z/, 'Z');
+            // 注意：不修改 updateTime，由 NapNeko 官方 CI 在合并后自动更新
 
             fs.writeFileSync(process.env.INDEX_FILE_NAME, JSON.stringify(data, null, 2) + '\n');
             console.log('✅ plugins.v4.json 已更新');
