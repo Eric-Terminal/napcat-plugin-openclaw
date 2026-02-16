@@ -40,7 +40,7 @@ export class ConfigManager {
     // NapCat 会在初始化后通过 plugin_config_ui 提供配置
     this.config = {
       openclaw: {
-        host: '202.47.135.226',
+        host: '127.0.0.1',
         port: 18789,
         token: '',
         user: 'root'
@@ -71,7 +71,7 @@ export class ConfigManager {
 
   getOpenClawConfig(): OpenClawConfig {
     return {
-      host: this.config.openclaw?.host || '202.47.135.226',
+      host: this.config.openclaw?.host || '127.0.0.1',
       port: this.config.openclaw?.port || 18789,
       token: this.config.openclaw?.token || '',
       user: this.config.openclaw?.user || 'root'

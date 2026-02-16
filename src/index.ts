@@ -251,7 +251,8 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
     }
 
     // User whitelist
-    const userWhitelist = currentConfig.behavior.userWhitelist;
+    const behavior = currentConfig.behavior || {};
+    const userWhitelist = behavior.userWhitelist || [];
     if (userWhitelist.length > 0) {
       if (!userWhitelist.some((id) => Number(id) === Number(userId))) return;
     }
@@ -259,13 +260,13 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
     let shouldHandle = false;
 
     if (messageType === 'private') {
-      if (!currentConfig.behavior.privateChat) return;
+      if (behavior.privateChat === false) return;
       shouldHandle = true;
     } else if (messageType === 'group') {
       if (!groupId) return;
-      const gWhitelist = currentConfig.behavior.groupWhitelist;
+      const gWhitelist = behavior.groupWhitelist || [];
       if (gWhitelist.length > 0 && !gWhitelist.some((id) => Number(id) === Number(groupId))) return;
-      if (currentConfig.behavior.groupAtOnly) {
+      if (behavior.groupAtOnly !== false) {
         const isAtBot = event.message?.some(
           (seg: any) => seg.type === 'at' && String(seg.data?.qq) === String(botUserId || event.self_id)
         );
@@ -408,16 +409,17 @@ export const plugin_cleanup = async (): Promise<void> => {
 
 // Flatten nested config to flat keys for WebUI
 function flattenConfig(cfg: PluginConfig): Record<string, any> {
+  const behavior = cfg.behavior || {};
   return {
-    token: cfg.openclaw.token,
-    gatewayUrl: cfg.openclaw.gatewayUrl,
-    cliPath: cfg.openclaw.cliPath,
-    privateChat: cfg.behavior.privateChat,
-    groupAtOnly: cfg.behavior.groupAtOnly,
-    userWhitelist: cfg.behavior.userWhitelist.join(','),
-    groupWhitelist: cfg.behavior.groupWhitelist.join(','),
-    debounceMs: cfg.behavior.debounceMs,
-    groupSessionMode: cfg.behavior.groupSessionMode,
+    token: cfg.openclaw?.token ?? '',
+    gatewayUrl: cfg.openclaw?.gatewayUrl ?? 'ws://127.0.0.1:18789',
+    cliPath: cfg.openclaw?.cliPath ?? '',
+    privateChat: behavior.privateChat ?? true,
+    groupAtOnly: behavior.groupAtOnly ?? true,
+    userWhitelist: (behavior.userWhitelist || []).join(','),
+    groupWhitelist: (behavior.groupWhitelist || []).join(','),
+    debounceMs: behavior.debounceMs ?? 2000,
+    groupSessionMode: behavior.groupSessionMode ?? 'user',
   };
 }
 
